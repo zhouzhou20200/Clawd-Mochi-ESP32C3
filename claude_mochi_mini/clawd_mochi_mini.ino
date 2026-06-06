@@ -35,7 +35,9 @@ Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 const char* AP_SSID = "ClaWD-Mochi";
 const char* AP_PASS = "clawd1234";
 WebServer server(80);
-
+unsigned long tick = 0;
+unsigned long idleBLTick = 0;
+const unsigned long BL_IDLE_MS = 45000;
 // ── Display ───────────────────────────────────────────────────
 #define DISP_W 240
 #define DISP_H 240
@@ -446,7 +448,7 @@ void animLogoReveal() {
     if (i % 4 == 0) { server.handleClient(); delay(speedMs(8)); }
   }
   drawLogoFilled(animBgColor, C_WHITE);
-  delay(1500);
+  delay(400);
   busy = false;
 }
 
@@ -892,6 +894,8 @@ void routeRoot() {
 }
 
 void routeCmd() {
+  idleBLTick = millis();
+  if(!backlightOn) setBacklight(true);
   if (!server.hasArg("k") || server.arg("k").isEmpty()) {
     server.send(400, "application/json", "{\"e\":1}"); return;
   }
@@ -917,6 +921,8 @@ void routeCmd() {
 }
 
 void routeChar() {
+  idleBLTick = millis();
+  if(!backlightOn) setBacklight(true);
   if (!termMode) { server.send(200, "application/json", "{\"ok\":1}"); return; }
   const String val = server.arg("c");
   if (val.length() > 0) termAddChar(val[0]);
@@ -924,12 +930,16 @@ void routeChar() {
 }
 
 void routeSpeed() {
+  idleBLTick = millis();
+  if(!backlightOn) setBacklight(true);
   if (server.hasArg("v")) animSpeed = constrain(server.arg("v").toInt(), 1, 3);
   server.send(200, "application/json", "{\"ok\":1}");
 }
 
 // /redraw?bg=hex — set animBg and immediately redraw current view
 void routeRedraw() {
+  idleBLTick = millis();
+  if(!backlightOn) setBacklight(true); 
   if (server.hasArg("bg")) {
     animBgColor = hexToRgb565(server.arg("bg"));
     drawBgColor = animBgColor;
@@ -950,6 +960,8 @@ void routeCanvas() {
 }
 
 void routeDrawClear() {
+  idleBLTick = millis();
+  if(!backlightOn) setBacklight(true);
   const String bg = server.hasArg("bg") ? server.arg("bg") : "#aa4818";
   drawBgColor = hexToRgb565(bg);
   animBgColor = drawBgColor;  // keep in sync
@@ -959,39 +971,42 @@ void routeDrawClear() {
 }
 
 void routeDrawStroke() {
+  idleBLTick = millis();
+  if(!backlightOn) setBacklight(true);
   if (!server.hasArg("pts") || !server.hasArg("pen")) {
-    server.send(200, "application/json", "{\"ok\":1}"); return;
+    server.send(200, "application/json", "{\"ok\":1}");
+    return;
   }
-  const uint16_t color = hexToRgb565(server.arg("pen"));
-  const String   data  = server.arg("pts");
+  uint16_t color = hexToRgb565(server.arg("pen"));
+  String data = server.arg("pts");
   currentView = VIEW_DRAW;
 
-  struct Pt { int16_t x, y; };
-  Pt prev = {-1, -1};
-  int start = 0;
-  while (start < (int)data.length()) {
-    int semi = data.indexOf(';', start);
-    if (semi == -1) semi = data.length();
-    String entry = data.substring(start, semi);
-    const int comma = entry.indexOf(',');
-    if (comma > 0) {
-      const int16_t x = entry.substring(0, comma).toInt();
-      const int16_t y = entry.substring(comma + 1).toInt();
-      if (prev.x >= 0) {
-        tft.drawLine(prev.x, prev.y, x, y, color);
-        tft.drawLine(prev.x + 1, prev.y, x + 1, y, color);
-        tft.drawLine(prev.x, prev.y + 1, x, y + 1, color);
-      } else {
-        tft.fillCircle(x, y, 2, color);
-      }
-      prev = {x, y};
+  char tmp[12];
+  int x, y, lastX = -1, lastY = -1;
+  int idx = 0, pos = 0;
+
+  while(idx < data.length()){
+    pos = 0;
+    while(idx<data.length() && data[idx]!=',') tmp[pos++] = data[idx++];
+    tmp[pos]=0; x=atoi(tmp); idx++; pos=0;
+    while(idx<data.length() && data[idx]!=';') tmp[pos++] = data[idx++];
+    tmp[pos]=0; y=atoi(tmp); idx++;
+
+    if(lastX == -1){
+      tft.fillCircle(x,y,2,color);
+    }else{
+      tft.drawLine(lastX,lastY,x,y,color);
+      tft.drawLine(lastX+1,lastY,x+1,y,color);
+      tft.drawLine(lastX,lastY+1,x,y+1,color);
     }
-    start = semi + 1;
+    lastX=x; lastY=y;
   }
   server.send(200, "application/json", "{\"ok\":1}");
 }
 
 void routeBacklight() {
+  idleBLTick = millis();
+  if(!backlightOn) setBacklight(true);
   setBacklight(server.hasArg("on") && server.arg("on") == "1");
   server.send(200, "application/json", "{\"ok\":1}");
 }
@@ -1030,7 +1045,7 @@ void setup() {
 
   SPI.begin(8, -1, 10, TFT_CS);   // SCK=8, MOSI=10
   tft.init(240, 240);
-  tft.setSPISpeed(40000000);
+  tft.setSPISpeed(24000000);
   tft.setRotation(1);
   initColours();
 
@@ -1045,8 +1060,12 @@ void setup() {
   animLogoReveal();
 
   // ── Start WiFi ─────────────────────────────────────────────
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASS);
+ WiFi.mode(WIFI_AP);
+IPAddress apIP(192,168,4,1);
+IPAddress gateway(192,168,4,1);
+IPAddress mask(255,255,255,0);
+WiFi.softAPConfig(apIP,gateway,mask);
+WiFi.softAP(AP_SSID, AP_PASS,6);   
 
   // ── WiFi info screen (stays until first web request) ───────
   tft.fillScreen(C_DARKBG);
@@ -1054,7 +1073,7 @@ void setup() {
   tft.setTextColor(C_WHITE);  tft.setTextSize(2);
   tft.setCursor(12, 16);  tft.print("WiFi: ClaWD-Mochi");
   tft.setTextColor(C_MUTED);  tft.setTextSize(1);
-  tft.setCursor(12, 44);  tft.print("password: clawd1234");
+  tft.setCursor(12, 44);  tft.print("password: claude1234");
   tft.setTextColor(C_WHITE);  tft.setTextSize(2);
   tft.setCursor(12, 68);  tft.print("Open browser:");
   tft.setTextColor(C_ORANGE); tft.setTextSize(2);
@@ -1084,4 +1103,16 @@ void setup() {
 //  LOOP
 // ═════════════════════════════════════════════════════════════
 
-void loop() { server.handleClient(); }
+void loop() {
+  server.handleClient();
+  delay(5);
+  //WiFi15s保活
+  if(millis()-tick>15000){
+    WiFi.softAPgetStationNum();
+    tick=millis();
+  }
+  //闲置自动关背光
+  if(backlightOn && millis() - idleBLTick > BL_IDLE_MS){
+    setBacklight(false);
+  }
+}
